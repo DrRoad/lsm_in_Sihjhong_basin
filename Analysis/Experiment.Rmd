@@ -1,0 +1,998 @@
+---
+title: "Landslide susceptibility mapping"
+author: "Merghadi Abdelaziz"
+date: "03/11/2018"
+output: html_document
+---
+
+```{r Setup, message=FALSE, warning=FALSE, include=FALSE}
+# checkpoint::setSnapshot("2018-10-09")
+## Setup Knitr options :
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE,cache = TRUE,fig.width = 7,fig.height = 7,dpi = 1200,cache.rebuild = F)
+
+## Assure That English is Sys. Language
+Sys.setenv(LANG = "en_US.UTF-8")
+Sys.setlocale(category = "LC_ALL",locale = "en_US.UTF-8")
+options(papersize = "special")
+
+## Loading Required Libraries 
+library(setRNG,quietly = T)
+library(ggplot2,quietly = T)
+library(dplyr,quietly = T)
+library(mlr,quietly = T)
+library(mlrMBO,quietly = T)
+#library(parallelMap,quietly = T)
+
+## Init. Project Folder Path 
+PROJHOME = normalizePath(rprojroot::find_rstudio_root_file())
+
+
+## Init. Necessary Folders
+## Checking the existence of certain folders if not create them
+ifelse(!dir.exists(file.path(PROJHOME,"Data")),dir.create(file.path(PROJHOME,"Data")),F)
+
+ifelse(!dir.exists(file.path(PROJHOME,"Outputs")),dir.create(file.path(PROJHOME,"Outputs")),F)
+
+ifelse(!dir.exists(file.path(PROJHOME,"Outputs","Tables")),dir.create(file.path(PROJHOME,"Outputs","Tables")),F)
+
+ifelse(!dir.exists(file.path(PROJHOME,"Outputs","Figures")),dir.create(file.path(PROJHOME,"Outputs","Figures")), F)
+ifelse(!dir.exists(file.path(PROJHOME,"Outputs","Figures","ASTER 30 Meters")),dir.create(file.path(PROJHOME,"Outputs","Figures","ASTER 30 Meters")), F)
+ifelse(!dir.exists(file.path(PROJHOME,"Outputs","Figures","Lidar_30_Meters")),dir.create(file.path(PROJHOME,"Outputs","Figures","Lidar_30_Meters")), F)
+ifelse(!dir.exists(file.path(PROJHOME,"Outputs","Figures","Lidar 5 Meters")),dir.create(file.path(PROJHOME,"Outputs","Figures","Lidar 5 Meters")), F)
+
+## Configure Mlr Package
+#mlr::configureMlr(show.info = T, show.learner.output = T,on.learner.warning = "quiet")
+mlr::configureMlr(show.info = T, show.learner.output = T)
+#checkpoint::setSnapshot(snapshotDate = "2018-09-05")
+
+
+  
+```
+
+The control object for the optimization is based on the Return of the best point ever visited according to true value of target function using Lower Confidence Bound (LCB) as an infill criterion that guides the model based on the search process both with kriging/RandomForest as surrogate models (depending on the problem we are solving), and 30 iteration of evaluations.
+A part from 30 evaultions mentioned above there exist *40 initial evaluations* marked as an initial design search space.
+
+```{r Init. Data & Resampling Discriptions, echo=TRUE}
+
+  ## Number of CPUs to use in Optimization
+  cpus = 2L
+  
+  ## seed for resampling stratigies
+  setRNG::setRNG("L'Ecuyer",101)
+
+  ## Load Input Data
+  Samples <- read.csv(paste0(PROJHOME,"\\Data","\\Input_Dataset.csv"),header = T)
+
+  # Load data as task with "Yes" as Positive Class to target ##
+  Lidar_5_Meters <- makeClassifTask(id= "Lidar 5 Meters",data =Samples[,c(1,2:10)],target = "Landslides", positive = "Yes" ,fixup.data = "quiet")
+  Lidar_30_Meters <- makeClassifTask(id= "Lidar 30 Meters",data =Samples[,c(1,11:19)],target = "Landslides", positive = "Yes" ,fixup.data = "quiet")
+  ASTER_30_Meters <- makeClassifTask(id= "ASTER 30 Meters",data =Samples[,c(1,20:28)],target = "Landslides", positive = "Yes" ,fixup.data = "quiet")
+  Benchmark_Task <- list(Lidar_5_Meters=Lidar_5_Meters,Lidar_30_Meters=Lidar_30_Meters,ASTER_30_Meters=ASTER_30_Meters)
+
+  ## Setup the desired resampling Stratigy With 10 CV as Nested Inner Sampling ##
+  Rdesc_Outer = makeResampleDesc(method = "Holdout",stratify = F,predict = "both",split=0.70)
+  Rdesc_Inner = makeResampleDesc(method = "CV",stratify = F,predict = "both",iters=10L)
+  Measures <- list(auc,acc,kappa,timeboth,setAggregation(auc,train.mean),setAggregation(acc,train.mean),setAggregation(kappa,train.mean))
+    
+  ## Init. Baysian Optimization Search Control
+  
+  # construct the Model Based Optimization control object 
+  ctrl = makeMBOControl()
+  
+  # We will allow for 30 iteration after the initial design of the objective function:
+  ctrl = setMBOControlTermination(ctrl,iters = 30L)
+
+  ## set Infill criteria to Optimize Confidence bound with variable lamdba based On The parameters Spaces to optimize 
+  ctrl = setMBOControlInfill(ctrl,crit=crit.cb)
+  # ctrl = setMBOControlInfill(ctrl)
+  ctrl = mlr::makeTuneControlMBO(mbo.control = ctrl)
+
+```
+
+# Init. The Learning Wrappers
+
+```{r Init. The Learning Wrappers, echo=TRUE, message=FALSE, warning=FALSE}
+  ## Set Seed
+  setRNG::setRNG("L'Ecuyer",101)
+
+  ## Init Hyperparamter set to be tuned
+  lr <- makeLearner("classif.binomial", id = "lr",predict.type = "prob")
+  lr.ps <- makeParamSet( makeDiscreteParam("link",values = "logit" ) )
+
+  
+  svm <- makeLearner("classif.svm", id = "svm",predict.type = "prob")
+  svm.ps = makeParamSet(makeDiscreteParam("type",values = "C-classification"),
+                        makeDiscreteParam("kernel", values = c("radial", "polynomial")),
+                        makeNumericParam("cost", -8, 8, trafo = function(x) 2^x),
+                        makeNumericParam("gamma", -8, 8, trafo = function(x) 2^x,requires = quote(kernel == "radial")))
+                        # makeIntegerParam("degree", lower = 1, upper = 4, requires = quote(kernel == "polynomial")))
+  rf = makeLearner("classif.ranger",id = "rf",predict.type = "prob")
+
+  rf.ps <- makeParamSet(makeLogicalParam("replace"),
+                        makeNumericParam("sample.fraction",0.632,1),
+                        makeIntegerParam("num.trees",32L,1024L),
+                        makeIntegerParam("mtry",2L,8L))
+
+  lrns <- list(lr = makeTuneWrapper(lr,Rdesc_Inner,lr.ps,measures = Measures,control = makeTuneControlGrid(resolution = 2L),show.info = T ),
+               svm = makeTuneWrapper(svm,Rdesc_Inner,svm.ps,measures = Measures,ctrl,show.info = T),
+               rf = makeTuneWrapper(rf,Rdesc_Inner,rf.ps,measures = Measures,ctrl,show.info = T)
+               )
+
+```
+
+# Perform The Benchmark Experiment
+
+```{r Perform The Benchmark Experiment, echo=TRUE, message=FALSE, warning=FALSE}
+  ## Set Seed
+  setRNG::setRNG("L'Ecuyer",101)
+
+  Bmr <- benchmark(learners = lrns,tasks = Benchmark_Task,resamplings = Rdesc_Outer,
+                 measures = Measures,models = T,keep.pred = T)
+  
+  ## Generate Overall Performace Table
+  getBMRAggrPerformances(Bmr, task.ids = NULL,
+                       learner.ids = NULL,as.df = T, drop = FALSE) %>% 
+  dplyr::mutate(.,learner = gsub("\\.preproc|\\.tuned|\\.dummied",
+                                 replacement = "",x = .$learner.id)) %>%
+  dplyr::mutate(.,learner.id=as.factor(.$learner)) %>% 
+    dplyr::select(-one_of(c("learner"))) -> Overall.Perf.table
+
+  write.csv(Overall.Perf.table,file.path(PROJHOME, "Outputs","Tables","Overall.Perf.table.csv"), row.names=F)
+  
+  ## Generate Optimal Hyperparamter set Table
+  Opt.Hyper.set = mlr::getBMRTuneResults(Bmr,as.df = T)
+  write.csv(Opt.Hyper.set,file.path(PROJHOME, "Outputs","Tables","Opt.Hyper.set.csv"), row.names=F)
+
+```
+
+
+## Ploting Critical Difference Result Function
+
+```{r Ploting Critical Difference Result Function, echo=TRUE, message=FALSE, warning=FALSE}
+  ## Set Seed
+
+plotcritdifferences <- function (obj, baseline = NULL, pretty.names = TRUE) 
+{
+  library(stringi)
+  assertClass(obj, "CritDifferencesData")
+  p = ggplot(obj$data)
+  p = p + geom_point(aes_string("mean.rank", 0, colour = "learner.id"), 
+                     size = 3)
+  p = p + geom_segment(aes_string("mean.rank", 0, xend = "mean.rank", 
+                                  yend = "yend", color = "learner.id"), size = 1)
+  p = p + geom_segment(aes_string("mean.rank", "yend", xend = "xend", 
+                                  yend = "yend", color = "learner.id"), size = 1)
+  if (pretty.names) {
+    p = p + geom_text(aes_string("xend", "yend", label = "short.name", 
+                                 color = "learner.id", hjust = "right"), vjust = -1)
+  }
+  else {
+    p = p + geom_text(aes_string("xend", "yend", label = "learner.id", 
+                                 color = "learner.id", hjust = "right"), vjust = -1)
+  }
+  p = p + xlab("Average Rank")
+  p = p + scale_x_continuous(breaks = c(0:max(obj$data$xend)))
+  p = p + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), 
+                axis.title.y = element_blank(), legend.position = "none", 
+                panel.background = element_blank(), panel.border = element_blank(), 
+                axis.line = element_line(size = 1), axis.line.y = element_blank(), 
+                panel.grid.major = element_blank(), plot.background = element_blank())
+  cd.x = obj$cd.info$x
+  cd.y = obj$cd.info$y
+  cd = obj$cd.info$cd
+  if (obj$cd.info$test == "bd") {
+    if (!is.null(baseline)) {
+      assertChoice(baseline, as.character(obj$data$learner.id))
+      cd.x = obj$data$mean.rank[obj$data$learner.id == 
+                                  baseline]
+    }
+    p = p + annotate("segment", x = cd.x + cd, xend = cd.x - 
+                       cd, y = cd.y, yend = cd.y, alpha = 0.5, color = "darkgrey", 
+                     size = 2)
+    p = p + annotate("segment", x = cd.x + cd, xend = cd.x + 
+                       cd, y = cd.y - 0.05, yend = cd.y + 0.05, color = "darkgrey", 
+                     size = 1)
+    p = p + annotate("segment", x = cd.x - cd, xend = cd.x - 
+                       cd, y = cd.y - 0.05, yend = cd.y + 0.05, color = "darkgrey", 
+                     size = 1)
+    p = p + annotate("point", x = cd.x, y = cd.y, alpha = 0.5)
+    p = p + annotate("text", label = stri_paste("Critical Difference =", 
+                                                round(cd, 2), sep = " "), x = cd.x, y = cd.y + 0.05)
+  }
+  else {
+    nemenyi.data = obj$cd.info$nemenyi.data
+    if (!(nrow(nemenyi.data) == 0L)) {
+      p = p + geom_segment(aes_string("xstart", "y", xend = "xend", 
+                                      yend = "y"), data = nemenyi.data, size = 2, 
+                           color = "dimgrey", alpha = 0.9)
+      p = p + annotate("text", label = stri_paste("Critical Difference =", 
+                                                  round(cd, 2), sep = " "), y = max(obj$data$yend) + 
+                         0.3, x = mean(obj$data$mean.rank))
+      p = p + annotate("segment", x = mean(obj$data$mean.rank) - 
+                         0.5 * cd, xend = mean(obj$data$mean.rank) + 
+                         0.5 * cd, y = max(obj$data$yend) + 0.2, yend = max(obj$data$yend) + 
+                         0.2, size = 2L)
+    }
+    else {
+      message("No connecting bars to plot!")
+    }
+  }
+  return(p)
+}
+  
+  
+  ### Bonferroni-Dunn test
+  cd.bonferroni <- generateCritDifferencesData(Bmr,measure = acc,p.value = 0.05, test = "bd", baseline = "lr.tuned")
+  
+  cd.bonferroni$data$learner.id <- c("lr","rf","svm")
+  cd.bonferroni$data$short.name <- c("Logistic Regression","Support Vector Machine","Random Forest")
+
+  cd.bonferroni.plot <- plotcritdifferences(cd.bonferroni,pretty.names = T) + coord_cartesian(xlim = c(-1,5), ylim = c(0,2)) + scale_colour_manual(values = c("lr" = "#F8766D", "svm" = "#00BA38", "rf" = "#619CFF"))
+    
+
+  ## Export cd.bonferroni.plot Plot
+
+  ggsave(file.path(PROJHOME, "Outputs","Figures","cd.bonferroni.plot.eps"),plot = cd.bonferroni.plot,width = 5,height = 5,dpi = 1200 ,device = "eps",units = "in")
+
+  ggsave(file.path(PROJHOME, "Outputs","Figures","jpg","cd.bonferroni.plot.jpg"),plot = cd.bonferroni.plot,width = 5,height = 5,dpi = 1200 ,device = "jpeg",units = "in")
+
+
+
+```
+
+
+
+```{r Generate the Overall Rank Matrix, echo=TRUE, message=FALSE, warning=FALSE}
+  ## Set Seed
+  setRNG::setRNG("L'Ecuyer",101)
+  cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+Overall.Rank.Matrix <-
+  plotBMRRanksAsBarChart(Bmr,
+                         pos = "tile",
+                         order.lrn = getBMRLearnerIds(Bmr),
+                         pretty.names = F) + ggplot2::scale_fill_manual(values = c("#999999", "#E69F00", "#56B4E9")) + ggplot2::theme_bw() +
+  ## Enhancing The The default Theme to be More Appealing
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = rel(1.2),
+      hjust = 0.5
+    ),
+    text = element_text(),
+    axis.line = element_line(colour = "black", size = 0.25),
+    #axis.title = element_text(face = "bold.italic"),
+    axis.title = element_text(face = "bold.italic", size = rel(1)),
+    axis.text.y  = element_text(
+      face = "bold.italic",
+      colour = "black",
+      angle = 0,
+      vjust = 0.5,
+      hjust = 0.5
+    ),
+    
+    axis.title.x = element_text(vjust = -0.2),
+    axis.ticks = element_line(),
+    #legend.title = element_blank(),
+    legend.title = element_text(face = "bold.italic", size = rel(1)),
+    legend.background = element_rect(
+      fill = "gray95",
+      color = "grey80",
+      size = 0.0625,
+      linetype = "solid"
+    ),
+    legend.key = element_rect(
+      fill = NA,
+      color = NA,
+      size = rel(1.2)
+    ),
+    ## For an Empty Legend Key That blend with The Overall Legend Fill ##
+    #legend.text = element_text(size = rel(0.85)),
+    legend.box.margin = ggplot2::margin(
+      r = 0.125 ,
+      l = 0.125,
+      t = 0,
+      b = 0,
+      unit = "pt"
+    ),
+    
+    #axis.text.x  = element_text(colour = "gray30",),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(
+      size = 0.125,
+      colour = "gray50",
+      fill = NA
+    ),
+    #panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(
+      fill = NA,
+      colour = "black",
+      size = 0.25,
+      linetype = "solid"
+    ),
+    
+    
+    
+    ## For Placing The Legend In the Bottom right Corner ##
+    legend.position = c("bottom"),
+    legend.justification = c("center"),
+    legend.box.just = "right",
+    legend.direction = "horizontal"
+  ) + guides(fill = guide_legend(title = ""))
+
+Overall.Rank.Matrix$data <-
+  dplyr::mutate(Overall.Rank.Matrix$data, learner.id = (
+    gsub(
+      "\\.preproc|\\.tuned|\\.dummied",
+      replacement = "",
+      x = Overall.Rank.Matrix$data$learner.id
+    )
+  ))
+
+  ## Export cd.bonferroni.plot Plot
+
+  ggsave(file.path(PROJHOME, "Outputs","Figures","Overall.Rank.Matrix.eps"),plot = Overall.Rank.Matrix,width = 5,height = 5,dpi = 1200 ,device = "eps",units = "in")
+
+
+  ggsave(file.path(PROJHOME, "Outputs","Figures","jpg","Overall.Rank.Matrix.jpg"),plot = Overall.Rank.Matrix,width = 5,height = 5,dpi = 1200 ,device = "jpeg",units = "in")
+
+
+
+```
+
+
+```{r Generate the ROC Curves, echo=TRUE, message=FALSE, warning=FALSE}
+
+library(dplyr, quietly = T)
+library(ggplot2, quietly = T)
+library(mlr, quietly = T)
+library(ggalt, quietly = T)
+
+Roc_Metrics <- list(fpr, tpr, acc, auc, f1)
+
+Color_Palette <-
+  c(
+    "#000000",
+    "#E69F00",
+    "#56B4E9",
+    "#009E73",
+    "#999999",
+    "#F0E442",
+    "#0072B2",
+    "#D55E00",
+    "#CC79A7"
+  )
+
+Threshold_Perf_Data <-
+  dplyr::bind_rows(lapply(mlr::getBMRTaskIds(Bmr), function(x) {
+    mlr::generateThreshVsPerfData(Bmr,
+                                  measures = Roc_Metrics,
+                                  task.id = x,
+                                  gridsize = 25L)$data %>%
+      dplyr::mutate(., task = x,
+                    Learner.id = (
+                      gsub(
+                        "\\.preproc|\\.tuned|\\.dummied",
+                        replacement = "",
+                        x = .$learner
+                      )
+                    ))
+  }))
+
+
+Roc.plot <- function(Threshold_Perf_Data) {
+  LTP <-
+    c("solid",
+      "dashed",
+      "dotted",
+      "4C88C488",
+      "12345678",
+      "longdash",
+      "twodash")
+  Linetype_Palette <-
+    rep(LTP, length.out = length(unique(Threshold_Perf_Data$Learner.id)))
+  #Size_Palette <- rep(ggplot2::rel(0.50),length.out=length(Learners))
+  Shape_Palette <-
+    rep(c(4, 15, 8, 18, 13, 20), length.out = length(unique(Threshold_Perf_Data$Learner.id)))
+  
+  ## Init The Default Scale_Labels Learner.id Column in Threshold_Perf_Data DF ##
+  Scale_Labels <-
+    unique(paste(sort(
+      Threshold_Perf_Data$Learner.id, decreasing = F
+    )))
+  
+  ## Init The Default Scale_Labels_With_AUC from Learner.id  & auc columns in Threshold_Perf_Data DF ##
+  Scale_Labels_With_AUC <-
+    unique(paste(
+      sort(Threshold_Perf_Data$Learner.id, decreasing = F),
+      "AUC =",
+      round(Threshold_Perf_Data[order(Threshold_Perf_Data$Learner.id, decreasing = F), "auc"], digits = 4)
+    ))
+  
+  gg <- ggplot(
+    data = Threshold_Perf_Data ,
+    aes(
+      x = fpr,
+      y = tpr,
+      colour = Learner.id,
+      #fill=Learner.id,
+      linetype = Learner.id,
+      #shape =Learner.id,
+      group = Learner.id
+    )
+  )
+  gg <- gg + ggalt::geom_xspline(size = rel(0.5)) +
+    #geom_line(size=0.7) +
+    #geom_point(size=0.7) +
+    geom_point(position = "jitter", size = 0.6) +
+    #Theme_Pub_Light +
+    geom_abline(
+      intercept = 0,
+      slope = 1,
+      linetype = "longdash",
+      colour = "gray75",
+      size = 0.4
+    ) +
+    
+    ## Fix Up Axes Limits to Envlope All Data ##
+    scale_x_continuous(limits = c(0, 1)) +
+    scale_y_continuous(limits = c(0, 1)) +
+    
+    ## Override The Default Aesthetic Passed By "Learner.id" to a More Pleasing One ##
+    scale_color_manual(values = Color_Palette, labels = Scale_Labels_With_AUC) +
+    #scale_linetype_manual(labels=Scale_Labels_With_AUC) +
+    scale_linetype_manual(values = Linetype_Palette, labels = Scale_Labels_With_AUC) +
+    #scale_size_manual(values = Size_Palette,labels=Scale_Labels_With_AUC) +
+    #scale_shape_manual(values = Shape_Palette,labels=Scale_Labels_With_AUC) +
+    
+    ## Specify The labels for Axis & The Diffrent Aesthetic Used ##
+    labs(
+      x = "False Postive Rate",
+      y = "True Positive Rate",
+      color = "",
+      shape = "",
+      linetype = ""
+      #fill="",size=""
+    ) +
+    ggplot2::theme_bw() +
+    
+    ## Enhancing The The default Theme to be More Appealing
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = rel(1.2),
+        hjust = 0.5
+      ),
+      text = element_text(),
+      panel.grid.major = element_line(
+        linetype = 2,
+        colour = "gray90",
+        size = 0.0625
+      ),
+      panel.grid.minor = element_line(
+        linetype = "4C88C488",
+        colour = "gray90",
+        size = 0.0625
+      ),
+      #panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white"),
+      panel.border = element_rect(
+        fill = NA,
+        colour = "black",
+        size = 0.25,
+        linetype = "solid"
+      ),
+      axis.line = element_line(colour = "black", size = 0.25),
+      #axis.title = element_text(face = "bold.italic"),
+      axis.title = element_text(face = "bold.italic", size = rel(1)),
+      axis.title.y = element_text(angle = 90, vjust = 2),
+      axis.title.x = element_text(vjust = -0.2),
+      axis.text = element_text(),
+      axis.ticks = element_line(),
+      legend.title = element_blank(),
+      legend.background = element_rect(
+        fill = "gray95",
+        color = "grey80",
+        size = 0.0625,
+        linetype = "solid"
+      ),
+      legend.key = element_rect(fill = NA, color = NA),
+      ## For an Empty Legend Key That blend with The Overall Legend Fill ##
+      #legend.text = element_text(size = rel(0.85)),
+      legend.box.margin = ggplot2::margin(
+        r = 0.125 ,
+        l = 0.125,
+        t = 0,
+        b = 0,
+        unit = "pt"
+      ),
+      
+      ## For Placing The Legend In the Bottom right Corner ##
+      legend.position = c(.99, .01),
+      legend.justification = c("right", "bottom"),
+      legend.box.just = "right"
+    ) +
+    
+    ## To Make Sure dashed Lines & Double dashed line Patterns Appears in The legend Keys ##
+    guides(linetype = guide_legend(override.aes = list(size = 0.55)))
+}
+
+roc.curves = lapply(unique(Threshold_Perf_Data$task), function(i) {
+  assign(paste("Data: ", i, sep = ""), Roc.plot(Threshold_Perf_Data[Threshold_Perf_Data$task == i, ]))
+})
+names(roc.curves) <- unique(Threshold_Perf_Data$task)
+
+lidar <- cowplot::plot_grid(roc.curves[[3]],roc.curves[[2]],labels = c("A","B"),nrow = 1)
+aster <- cowplot::plot_grid(roc.curves[[1]],labels = "C",ncol = 1)
+
+roc.plot.stack <- cowplot::plot_grid(lidar,aster,labels = c("",""),ncol = 1)
+  ## Export cd.bonferroni.plot Plot
+
+  ggsave(file.path(PROJHOME, "Outputs","Figures","roc.plot.stack.eps"),plot = roc.plot.stack,width = 5,height = 5,dpi = 1200 ,device = "eps",units = "in")
+  ggsave(file.path(PROJHOME, "Outputs","Figures","jpg","roc.plot.stack.jpg"),plot = roc.plot.stack,width = 5,height = 5,dpi = 1200 ,device = "jpeg",units = "in")
+
+  
+  time.Comparison <- function(Input.Data,var.x,var.y,var.z,var.label,lab.x,lab.y,lab.z,legend.direction){
+    library(ggplot2,quietly = T)
+    library(scales,quietly = T)
+    data = dplyr::arrange(Input.Data, learner.id)
+    data = dplyr::arrange(Input.Data, learner.id)
+    ## Init. Necessary  Color Palette
+    cbPalette <- rep(c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7"),length(unique(data$task.id)))
+    
+    ## init. The Initial GGobject design with Desired Aesthetic ##
+    gg <- ggplot(data = data,aes_string(x=var.x,y=var.y,fill=var.z))
+    
+    ## Init. Plot Limits for Clean Plots ##
+    ylimit <- layer_scales(gg)$y$range$range
+    
+    ## specify The desired Geoms Necessary For The Plot ##
+    gg <- gg + geom_col(position="dodge") +
+      geom_text(mapping = aes(label = sprintf("%.2f", data[[var.label]])),size=rel(3.5),position = position_dodge(width = 1),vjust= 0.5,hjust = -0.25) +
+      scale_fill_manual(values = cbPalette) +
+      #scale_fill_brewer(palette = "Set3") +
+      
+      ## Fix Up Axes Limits to Envlope All Data ##
+      scale_y_continuous(breaks = scales::extended_breaks(n = 10),expand = c(0.02,0)) +
+      expand_limits(y=c(ylimit[1],ylimit[2]+ylimit[2]*0.15)) +
+      
+      ## Flip Axes
+      coord_flip() +
+      
+      ## Specify The labels for Axis & The Diffrent Aesthetic Used ##
+      labs(x=lab.x, y=lab.y,fill=lab.z,color="",shape="",linetype="",size="") +
+      ggplot2::theme_bw() +
+      
+      ## Enhancing The The default Theme to be More Appealing
+      theme(plot.title = element_text(face = "bold",size = rel(1.2), hjust = 0.5),
+            text = element_text(),
+            panel.grid.major = element_line(linetype=2,colour = "gray95", size = 0.0625),
+            panel.grid.major.y=element_blank(),
+            panel.grid.minor = element_blank(),
+            #panel.grid.minor = element_blank(),
+            panel.background = element_rect(fill = "white"),
+            panel.border = element_rect(fill = NA,colour = "black",size = 0.25,linetype = "solid"),
+            axis.line = element_line(colour = "black",size = 0.25),
+            #axis.title = element_text(face = "bold.italic"),
+            axis.title = element_text(face = "bold.italic",size = rel(1)),
+            axis.title.y = element_text(angle=90,vjust =2),
+            axis.title.x = element_text(vjust = -0.2),
+            axis.text = element_text(),
+            axis.ticks = element_line(),
+            legend.title = element_text(face = "bold.italic",size = rel(1)),
+            legend.background = element_rect(fill = "gray95",color = "grey80",size = 0.0625,linetype = "solid"),
+            legend.key = element_rect(fill = NA,color = NA), ## For an Empty Legend Key That blend with The Overall Legend Fill ##
+            #legend.text = element_text(size = rel(0.85)),
+            legend.box.margin = ggplot2::margin(r = 0.125 ,l = 0.125,t = 0,b = 0,unit = "pt"),
+            
+            ## For Placing The Legend In the Bottom right Corner ##
+            legend.position = c(0.99, 0.01),
+            legend.justification = c("right", "bottom"),
+            legend.box.just = "right",
+            legend.direction = legend.direction)
+    
+    
+    print(gg)
+    return(gg)
+  }
+
+
+  time_summary = time.Comparison(Input.Data = Overall.Perf.table,var.x = "learner.id",
+                                                     var.y = "timeboth.test.mean",var.z = "task.id",
+                                                     var.label = "timeboth.test.mean",
+                                                     lab.x =  "",lab.y = "Time required for Training + Testing (Sec)",lab.z = "Dataset",
+                                                     legend.direction="horizontal") + theme(legend.position = "bottom",legend.direction = "horizontal",legend.justification = "centre")
+  
+  
+  ggsave(file.path(PROJHOME, "Outputs","Figures","time_summary.eps"),plot = time_summary,width = 5,height = 5,dpi = 1200 ,device = "eps",units = "in")
+  ggsave(file.path(PROJHOME, "Outputs","Figures","jpg","time_summary.jpg"),plot = time_summary,width = 5,height = 5,dpi = 1200 ,device = "jpeg",units = "in")
+
+```
+
+
+```{r Preform Predictions, echo=TRUE, message=FALSE, warning=FALSE}
+tune.results <- getBMRTuneResults(Bmr)
+
+train.model <- function(tune.result,task){
+  lapply(tune.result, function(i){
+    par.vals <- i[[1]]$x
+    type <- i[[1]]$learner$type
+    short.name <- i[[1]]$learner$short.name
+    id <- gsub("\\.preproc|\\.tuned|\\.dummied",replacement = "",x = i[[1]]$learner$id)
+    
+    task_data <- makeResampleInstance(desc = makeResampleDesc(method = "Holdout",stratify = T,predict = "both",split=2/3),task = task)
+    task_data <- getTaskData(task,subset=unlist(task_data$train.inds))
+    task_data <- makeClassifTask(id= "Prediction",data =task_data,target = "Landslides", positive = "Yes" ,fixup.data = "quiet")
+    
+    mlr::train(mlr::setHyperPars(makeLearner(paste(type,short.name,sep = "."),id,predict.type = "prob",predict.threshold = 0.5), par.vals = par.vals), task)})
+
+  
+}
+
+
+prediction_func <- function(Learners_List,Predict_Raw_Data){lapply(Learners_List,function(x){
+  ## Loading Required Libraries 
+  library(dplyr,quietly = T)
+  library(mlr,quietly = T)
+  
+  setRNG::setRNG("L'Ecuyer",101)
+  
+  dplyr::select(Predict_Raw_Data,-c(Id,x,y)) -> Predict_data
+  #dplyr::select(i, c(Id,x,y)) -> Predict_Join_Outer 
+  dplyr::select(Predict_Raw_Data, c(Id,x,y)) %>%
+    dplyr::mutate(.,Id.Inner = as.integer(row.names(.)))-> Predict_Join_Inner
+  
+ 
+  ## Incase of using train model instead of resample
+  Predicted_data=predict(x,newdata=Predict_data)
+  Predicted_data=as.data.frame(Predicted_data)
+  Predicted_data=dplyr::mutate(Predicted_data,Id.Inner = as.integer(row.names(Predicted_data)))
+  
+  #Predicted_data=dplyr::mutate(.,Learner = gsub("\\.preproc|\\.tuned|\\.dummied",replacement = "",x = x[["learner.id"]])) %>%
+  #Predicted_data=dplyr::mutate(Learner = gsub("\\.preproc|\\.tuned|\\.dummied",replacement = "",x = x[["learner.id"]] )) %>%
+  
+  ## Incase of using train model instead of resample
+  Predicted_data=dplyr::mutate(Predicted_data,Learner = gsub("\\.preproc|\\.tuned|\\.dummied",replacement = "",x = x[["learner"]][["id"]]))
+  
+  Predicted_data=plyr::rename(Predicted_data,c("prob.No" = "Prb_N","prob.Yes" = "Prb_Y","response" = "Res"))
+  
+  Predicted_data=dplyr::inner_join(Predict_Join_Inner,Predicted_data,by= "Id.Inner") 
+  #return(Predicted_data)
+})} 
+
+# Generate Rasters from Yes Class Prediction Dataframes
+prediction_to_raster <- function(Predicted_Splitted,crs){lapply(Predicted_Splitted,function(x){
+  #library(sp,quietly = T)
+  library(raster,quietly = T)
+  
+  # create spatial points data frame from regular grid
+  # raster::rasterFromXYZ(x[,c("x", "y", "Prb_Y")],crs = crs,digits = 6)
+
+    # # Keep only XYZ Columns
+    # x <- x[,c("x", "y", "Prb_Y")]
+    # 
+    # # create spatial points data frame
+    # sp::coordinates(x) <- ~x+y
+    # sp::proj4string(x) <- crs
+    # 
+    # # coerce to SpatialPixelsDataFrame
+    # sp::gridded(x) <- TRUE
+    # 
+    # # coerce to raster
+    # raster::raster(x)
+  
+  ## If The prediction is not regular grid than use the following:
+    cell_size <- 15
+    xmn=218965.371529
+    xmx=227620.371529
+    ymn=2437333.30395
+    ymx=2447233.30395
+    
+    r <- raster(xmn=xmn, xmx=xmx, ymn=ymn, ymx=ymx, res=cell_size, crs=crs)
+  
+    rasterize(x[,c('x','y')], r, x[,c('Prb_Y')], fun=mean)
+  
+})}
+
+# reclassify raster Values into five groups by Incremantal 0.2 
+prediction_to_raster_reclassify <- function(raster.list){lapply(raster.list,function(x){
+  
+  # Init. Reclassifying Vector
+  rclmat <- c(-Inf, 0.15, 1, 0.15, 0.45, 2, 0.45, 0.75, 3, 0.75, 0.90, 4, 0.90, Inf, 5)
+  
+  # Generate Reclassifying Matrix
+  rclmat <- base::matrix(rclmat, ncol=3, byrow=TRUE)
+  
+  # Reclassify Rasters
+  raster::reclassify(x, rclmat)
+  
+})}
+
+
+
+# Read Landdslide Inventory Shapefile Without a Z field Only XY
+Ls_Pts <- rgdal::readOGR(file.path(PROJHOME,"Data","Prediction_Data","Samples_Taiwan.shp"),pointDropZ = T)
+
+# Generate Summary Table
+Summary_Table <- function(raster.list.rc){dplyr::bind_rows(lapply(1:length(raster.list.rc),function(x){
+
+  levels <- c(-Inf,1, 2, 3, 4, Inf)
+  labels <- c("Very Low", "Low", "Moderate", "High", "Very High")
+
+  ## Extract Values From Input layers Into the Previous Samples
+  raster::extract(raster.list.rc[[x]],Ls_Pts,fun=sum(),na.rm=TRUE, df=TRUE,sp=FALSE) %>%
+    #as.data.frame(.) %>%
+    dplyr::mutate(ID = 1L) %>%
+    dplyr::mutate(Learner = gsub("\\.preproc|\\.tuned|\\.dummied",replacement = "",x = names(raster.list.rc[x]))) %>%
+
+    #x[is.na(x)] <- 0
+    dplyr::mutate(.,Layer = replace(layer, is.na(layer), 5)) %>%
+    dplyr::mutate(.,Level = base::cut(Layer, levels, labels, right = TRUE)) %>%
+
+    #dplyr::mutate(.,layer = replace(layer, which(layer,is.na()), NA)) %>%
+    dplyr::group_by(Layer,Learner,Level) %>%
+    dplyr::summarize(Summary = sum(ID)) %>%
+    dplyr::mutate(.,Summary_Perc = round(Summary * 100 / length(Ls_Pts$Landslides)))
+
+}))}
+
+Summary_Table_Px_Count <- function(Predicted_Splitted){dplyr::bind_rows(lapply(1:length(Predicted_Splitted),function(x){
+
+  #levels <- c(-Inf,1, 2, 3, 4, Inf)
+  labels <- c("Very Low", "Low", "Moderate", "High", "Very High")
+
+  #labels <- c("Very High", "High", "Moderate", "Low", "Very Low")
+  vals <- Predicted_Splitted[[x]]$Prb_Y
+  cell.count=length(vals) 
+  Very.Low = length(vals[vals <= 0.15])
+  Low = length(vals[vals > 0.15 & vals <= 0.45])
+  Moderate = length(vals[vals > 0.45 & vals <= 0.75])
+  High = length(vals[vals > 0.75 & vals <= 0.90])
+  Very.High = length(vals[vals > 0.90])
+
+
+  # Very.Low = length(subset(vals,vals <= 0.15))
+  # Low = length(subset(vals, vals > 0.15 & vals <= 0.45))
+  # Moderate = length(subset(vals, vals > 0.45 & vals <= 0.75))
+  # High = length(subset(vals, vals > 0.75 & vals <= 0.90))
+  # Very.High = length(subset(vals, vals > 0.90))
+  ## Extract Values From Input layers Into the Previous Samples
+  data.frame(Layer=1:5,Level=labels,
+             ncells=c(Very.Low,Low,Moderate,High,Very.High),
+             Summary_Perc = c(round((Very.Low/cell.count)*100,2),
+                              round((Low/cell.count)*100,2),
+                              round((Moderate/cell.count)*100,2),
+                              round((High/cell.count)*100,2),
+                              round((Very.High/cell.count)*100,2))
+  ) %>%
+
+    dplyr::mutate(Learner = gsub("\\.preproc|\\.tuned|\\.dummied",replacement = "",x = names(Predicted_Splitted[x]))) %>%
+    #dplyr::group_by(Layer,Learner,Level) %>%
+    dplyr::arrange(., Layer) %>%
+    mutate(Level = factor(Level,Level))
+
+  #dd$Level= factor(dd$Level,levels=dplyr::arrange(Summary_Table_Px_Count, Layer)$Level, TRUE)
+
+}))}
+
+# Init. Prediction Camparison  Barplot using Summary Table
+Prediction.Comparison <- function(Input.Data,var.x,var.y,var.z,var.label,lab.x,lab.y,lab.z,legend.direction){
+  library(ggplot2,quietly = T)
+  library(scales,quietly = T)
+  data = dplyr::arrange(Input.Data, Layer)
+  ## Init. Necessary  Color Palette
+  cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+  ## init. The Initial GGobject design with Desired Aesthetic ##
+  gg <- ggplot(data = data,aes_string(x=var.x,y=var.y,fill=var.z))
+
+  ## Init. Plot Limits for Clean Plots ##
+  ylimit <- layer_scales(gg)$y$range$range
+
+  ## specify The desired Geoms Necessary For The Plot ##
+  gg <- gg + geom_col(position="dodge") +
+    geom_text(mapping = aes(label = sprintf("%1.2f%%", data[[var.label]])),size=rel(3.5),position = position_dodge(width = 1),vjust= 0.5,hjust = -0.25) +
+    scale_fill_manual(values = cbPalette) +
+    #scale_fill_brewer(palette = "Set3") +
+
+    ## Fix Up Axes Limits to Envlope All Data ##
+    scale_y_continuous(breaks = scales::extended_breaks(n = 10),expand = c(0.02,0),labels = function(x){paste0(x, "%")}) +
+    expand_limits(y=c(ylimit[1],ylimit[2]+ylimit[2]*0.15)) +
+
+    ## Flip Axes
+    coord_flip() +
+
+    ## Specify The labels for Axis & The Diffrent Aesthetic Used ##
+    labs(x=lab.x, y=lab.y,fill=lab.z,color="",shape="",linetype="",size="") +
+    ggplot2::theme_bw() +
+
+    ## Enhancing The The default Theme to be More Appealing
+    theme(plot.title = element_text(face = "bold",size = rel(1.2), hjust = 0.5),
+          text = element_text(),
+          panel.grid.major = element_line(linetype=2,colour = "gray95", size = 0.0625),
+          panel.grid.major.y=element_blank(),
+          panel.grid.minor = element_blank(),
+          #panel.grid.minor = element_blank(),
+          panel.background = element_rect(fill = "white"),
+          panel.border = element_rect(fill = NA,colour = "black",size = 0.25,linetype = "solid"),
+          axis.line = element_line(colour = "black",size = 0.25),
+          #axis.title = element_text(face = "bold.italic"),
+          axis.title = element_text(face = "bold.italic",size = rel(1)),
+          axis.title.y = element_text(angle=90,vjust =2),
+          axis.title.x = element_text(vjust = -0.2),
+          axis.text = element_text(),
+          axis.ticks = element_line(),
+          legend.title = element_text(face = "bold.italic",size = rel(1)),
+          legend.background = element_rect(fill = "gray95",color = "grey80",size = 0.0625,linetype = "solid"),
+          legend.key = element_rect(fill = NA,color = NA), ## For an Empty Legend Key That blend with The Overall Legend Fill ##
+          #legend.text = element_text(size = rel(0.85)),
+          legend.box.margin = ggplot2::margin(r = 0.125 ,l = 0.125,t = 0,b = 0,unit = "pt"),
+
+          ## For Placing The Legend In the Bottom right Corner ##
+          legend.position = c(0.99, 0.01),
+          legend.justification = c("right", "bottom"),
+          legend.box.just = "right",
+          legend.direction = legend.direction)
+
+
+  print(gg)
+  return(gg)
+}
+
+Predict_Raw_Data <- read.csv(paste0(PROJHOME,"\\Data","\\Prediction_Data","\\Prediction_Dataset_15_meters3.csv"),header = T)
+Predict_Raw_Data$X <- NULL
+#names(Predict_Raw_Data)[1] <- "Id"
+setRNG::setRNG("L'Ecuyer",101)
+Learners_List_Aster_30_Meters <- train.model(tune.results$`ASTER 30 Meters`,ASTER_30_Meters)
+Learners_List_Lidar_30_Meters <- train.model(tune.results$`Lidar 30 Meters`,Lidar_30_Meters)
+Learners_List_Lidar_5_Meters <- train.model(tune.results$`Lidar 5 Meters`,Lidar_5_Meters)
+
+
+
+Lidar_5_Meters_Prediction <- prediction_func(Learners_List_Lidar_5_Meters,Predict_Raw_Data[,c(1,2:11,32,33)])
+
+Lidar_30_Meters_Prediction <- prediction_func(Learners_List_Lidar_30_Meters,Predict_Raw_Data[,c(1,12:21,32,33)])
+
+ASTER_30_Meters_Prediction <- prediction_func(Learners_List_Aster_30_Meters,Predict_Raw_Data[,c(1,22:31,32,33)])
+
+Lidar_5_Meters_raster <- prediction_to_raster(Lidar_5_Meters_Prediction,"+proj=tmerc +lat_0=0 +lon_0=121 +k=0.9999 +x_0=250000 +y_0=0 +ellps=GRS80 +units=m +no_defs")
+Lidar_30_Meters_raster <- prediction_to_raster(Lidar_30_Meters_Prediction,"+proj=tmerc +lat_0=0 +lon_0=121 +k=0.9999 +x_0=250000 +y_0=0 +ellps=GRS80 +units=m +no_defs")
+ASTER_30_Meters_raster <- prediction_to_raster(ASTER_30_Meters_Prediction,"+proj=tmerc +lat_0=0 +lon_0=121 +k=0.9999 +x_0=250000 +y_0=0 +ellps=GRS80 +units=m +no_defs")
+
+Lidar_5_Meters_raster_rc <- prediction_to_raster_reclassify(Lidar_5_Meters_raster)
+Lidar_30_Meters_raster_rc <- prediction_to_raster_reclassify(Lidar_30_Meters_raster)
+ASTER_30_Meters_raster_rc <- prediction_to_raster_reclassify(ASTER_30_Meters_raster)
+
+# Export Raster Externally
+  
+  for(i in 1:length(Lidar_5_Meters_raster)){
+    # Export Raster with Raw Prediction Probabilities
+    raster::writeRaster(ASTER_30_Meters_raster[[i]], filename = file.path(PROJHOME, "Outputs","Figures","ASTER 30 Meters",paste0(names(ASTER_30_Meters_raster[i]),".tif")), format = "GTiff",overwrite=TRUE)
+    
+    raster::writeRaster(Lidar_30_Meters_raster[[i]], filename = file.path(PROJHOME, "Outputs","Figures","Lidar_30_Meters",paste0(names(Lidar_30_Meters_raster[i]),".tif")), format = "GTiff",overwrite=TRUE)
+        
+    raster::writeRaster(Lidar_5_Meters_raster[[i]], filename = file.path(PROJHOME, "Outputs","Figures","Lidar 5 Meters",paste0(names(Lidar_5_Meters_raster[i]),".tif")), format = "GTiff",overwrite=TRUE)
+    
+    # Export Raster with reclassified Prediction Probabilities
+    raster::writeRaster(ASTER_30_Meters_raster_rc[[i]], filename = file.path(PROJHOME, "Outputs","Figures","ASTER 30 Meters",paste0(names(ASTER_30_Meters_raster_rc[i]),"_rc.tif")), format = "GTiff",overwrite=TRUE)
+    
+    raster::writeRaster(Lidar_30_Meters_raster_rc[[i]], filename = file.path(PROJHOME, "Outputs","Figures","Lidar_30_Meters",paste0(names(Lidar_30_Meters_raster_rc[i]),"_rc.tif")), format = "GTiff",overwrite=TRUE)
+        
+    raster::writeRaster(Lidar_5_Meters_raster_rc[[i]], filename = file.path(PROJHOME, "Outputs","Figures","Lidar 5 Meters",paste0(names(Lidar_5_Meters_raster_rc[i]),"_rc.tif")), format = "GTiff",overwrite=TRUE)
+    
+  }
+
+
+
+Lidar_5_Meters_summary <- Summary_Table(Lidar_5_Meters_raster_rc)
+Lidar_30_Meters_summary <- Summary_Table(Lidar_30_Meters_raster_rc)
+ASTER_30_Meters_summary <- Summary_Table(ASTER_30_Meters_raster_rc)
+
+Lidar_5_Meters_summary_px <- Summary_Table_Px_Count(Lidar_5_Meters_Prediction)
+Lidar_30_Meters_summary_px  <- Summary_Table_Px_Count(Lidar_30_Meters_Prediction)
+ASTER_30_Meters_summary_px  <- Summary_Table_Px_Count(ASTER_30_Meters_Prediction)
+
+
+##
+Lidar_5_Meters_summary_plot =Prediction.Comparison(Input.Data = Lidar_5_Meters_summary,var.x = "Learner",
+                             var.y = "Summary_Perc",var.z = "Level",var.label = "Summary_Perc",
+                             lab.x =  "",lab.y = "Landslide Density",lab.z = "Susceptibility ",
+                             legend.direction="horizontal") + theme(legend.position = "bottom",legend.direction = "horizontal",legend.justification = "centre")
+
+Lidar_5_Meters_summary_px_plot =Prediction.Comparison(Input.Data = Lidar_5_Meters_summary_px,var.x = "Learner",
+                             var.y = "Summary_Perc",var.z = "Level",var.label = "Summary_Perc",
+                             lab.x =  "",lab.y = "Area Extent",lab.z = "Susceptibility",
+                             legend.direction="vertical") + theme(legend.position = "bottom",legend.direction = "horizontal",legend.justification = "centre")
+
+###
+
+Lidar_30_Meters_summary_plot =Prediction.Comparison(Input.Data = Lidar_30_Meters_summary,var.x = "Learner",
+                             var.y = "Summary_Perc",var.z = "Level",var.label = "Summary_Perc",
+                             lab.x =  "",lab.y = "Landslide Density",lab.z = "Susceptibility ",
+                             legend.direction="horizontal") + theme(legend.position = "bottom",legend.direction = "horizontal",legend.justification = "centre")
+
+Lidar_30_Meters_summary_px_plot =Prediction.Comparison(Input.Data = Lidar_30_Meters_summary_px,var.x = "Learner",
+                             var.y = "Summary_Perc",var.z = "Level",var.label = "Summary_Perc",
+                             lab.x =  "",lab.y = "Area Extent",lab.z = "Susceptibility",
+                             legend.direction="vertical") + theme(legend.position = "bottom",legend.direction = "horizontal",legend.justification = "centre")
+
+##
+ASTER_30_Meters_summary_plot =Prediction.Comparison(Input.Data = ASTER_30_Meters_summary,var.x = "Learner",
+                             var.y = "Summary_Perc",var.z = "Level",var.label = "Summary_Perc",
+                             lab.x =  "",lab.y = "Landslide Density",lab.z = "Susceptibility ",
+                             legend.direction="horizontal") + theme(legend.position = "bottom",legend.direction = "horizontal",legend.justification = "centre")
+
+ASTER_30_Meters_summary_px_plot =Prediction.Comparison(Input.Data = ASTER_30_Meters_summary_px,var.x = "Learner",
+                             var.y = "Summary_Perc",var.z = "Level",var.label = "Summary_Perc",
+                             lab.x =  "",lab.y = "Area Extent",lab.z = "Susceptibility",
+                             legend.direction="vertical") + theme(legend.position = "bottom",legend.direction = "horizontal",legend.justification = "centre")
+# 
+# ggsave(file.path(PROJHOME, "Outputs","Figures","roc.plot.stack.eps"),plot = roc.plot.stack,width = 5,height = 5,dpi = 1200 ,device = "eps",units = "in")
+
+suff_plot_raw = list(Lidar_5_Meters_summary_plot=Lidar_5_Meters_summary_plot, Lidar_5_Meters_summary_px_plot=Lidar_5_Meters_summary_px_plot, Lidar_30_Meters_summary_plot=Lidar_30_Meters_summary_plot, Lidar_30_Meters_summary_px_plot=Lidar_30_Meters_summary_px_plot, ASTER_30_Meters_summary_plot=ASTER_30_Meters_summary_plot, ASTER_30_Meters_summary_px_plot=ASTER_30_Meters_summary_px_plot)
+
+
+suff_plot_lidar_5 <- cowplot::plot_grid(suff_plot_raw[[1]],suff_plot_raw[[2]],labels = c("A","B"),nrow = 2)
+suff_plot_lidar_30 <- cowplot::plot_grid(suff_plot_raw[[3]],suff_plot_raw[[4]],labels = c("C","D"),nrow = 2)
+suff_plot_aster <- cowplot::plot_grid(suff_plot_raw[[5]],suff_plot_raw[[6]],labels = c("E","F"),nrow = 2)
+suff_plot_comb <- list(suff_plot_lidar_5=suff_plot_lidar_5,suff_plot_lidar_30=suff_plot_lidar_30,suff_plot_aster=suff_plot_aster)
+
+
+suff_plot_lidar_5_r <- cowplot::plot_grid(suff_plot_raw[[1]] + theme(legend.position="none"),suff_plot_raw[[2]] + theme(legend.position="none"),labels = c("A","B"),align = 'vh',hjust = -1,nrow = 1)
+suff_plot_lidar_30_r <- cowplot::plot_grid(suff_plot_raw[[3]] + theme(legend.position="none"),suff_plot_raw[[4]] + theme(legend.position="none"),labels = c("C","D"),align = 'vh',hjust = -1,nrow = 1)
+suff_plot_aster_r <- cowplot::plot_grid(suff_plot_raw[[5]] + theme(legend.position="none"),suff_plot_raw[[6]] + theme(legend.position="none"),labels = c("E","F"),align = 'vh',hjust = -1,nrow = 1)
+
+# extract the legend from one of the plots
+# (clearly the whole thing only makes sense if all plots
+# have the same legend, so we can arbitrarily pick one.)
+legend_1 <- cowplot::get_legend(suff_plot_raw[[1]])
+# legend_2 <- cowplot::get_legend(suff_plot_raw[[2]])
+# legends <- cowplot::plot_grid(legend_1,legend_2, labels = c("",""),align = 'vh',hjust = -1,nrow = 1)
+
+
+suff_plot_stack <- cowplot::plot_grid(suff_plot_lidar_5_r,suff_plot_lidar_30_r,suff_plot_aster_r,legend_1,labels = c("",""),ncol = 1,rel_heights = c(1,1,1,0.2),vjust = c(1.5,1.5,1.5,-0.1))
+
+
+  for(i in 1:length(suff_plot_raw)){
+    
+    # for EPS
+    ggsave(file.path(PROJHOME, "Outputs","Figures",paste0(names(suff_plot_raw[i]),".eps")),plot = suff_plot_raw[[i]],width = 5,height = 5,dpi = 1200 ,device = "eps",units = "in")
+    
+    # for JPG
+    ggsave(file.path(PROJHOME, "Outputs","Figures","jpg",paste0(names(suff_plot_raw[i]),".jpg")),plot = suff_plot_raw[[i]],width = 5,height = 5,dpi = 1200 ,device = "jpg",units = "in")
+  }
+
+## Exporting Figures
+    # for EPS
+   ggsave(file.path(PROJHOME, "Outputs","Figures","suff_plot_stack.eps"),plot = suff_plot_stack,width = 10,height = 10,dpi = 1200 ,device = "eps",units = "in")
+    
+    # for JPG
+    ggsave(file.path(PROJHOME, "Outputs","Figures","jpg","suff_plot_stack.jpg"),plot= suff_plot_stack,width = 10,height = 10,dpi = 1200 ,device = "jpg",units = "in")
+    
+    
+
+
+
+  for(i in 1:length(suff_plot_comb)){
+    
+    # for EPS
+    ggsave(file.path(PROJHOME, "Outputs","Figures",paste0(names(suff_plot_comb[i]),".eps")),plot = suff_plot_comb[[i]],width = 7,height = 7,dpi = 1200 ,device = "eps",units = "in")
+    
+    # for JPG
+    ggsave(file.path(PROJHOME,"Outputs","Figures","jpg",paste0(names(suff_plot_comb[i]),".jpg")),plot = suff_plot_comb[[i]],width = 7,height = 7,dpi = 1200 ,device = "jpg",units = "in")
+  }
+
+  ## Export cd.bonferroni.plot Plot
+
+save.image("C:/Users/AMOUN/Desktop/Thesis/Dou/Taiwan/Project/3.RData")
+
+plot(Lidar_5_Meters_raster)
+x1=cowplot::plot_grid(plot(Lidar_5_Meters_raster$lr.tuned),plot(Lidar_5_Meters_raster$rf.tuned),plot(Lidar_5_Meters_raster$svm.tuned))
+x2=cowplot::plot_grid(plot(Lidar_30_Meters_raster$lr.tuned),plot(Lidar_30_Meters_raster$rf.tuned),plot(Lidar_30_Meters_raster$svm.tuned))
+x3=cowplot::plot_grid(plot(ASTER_30_Meters_raster$lr.tuned),plot(ASTER_30_Meters_raster$rf.tuned),plot(ASTER_30_Meters_raster$svm.tuned))
+tot=cowplot::plot_grid(x1,x2,x3)
+ggsave("tot.jpg",plot =tot ,width = 10,height = 10,dpi = 1200 ,device = "jpg",units = "in")
+
+```
